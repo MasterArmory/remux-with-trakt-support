@@ -1,9 +1,11 @@
 pub mod codecs;
+pub mod media_trackers;
 pub mod provider_ids;
 pub use codecs::{
     AudioCodec, AudioContainer, DlnaProfileType, SubtitleCodec, TranscodingProtocol,
     VideoCodec, VideoContainer,
 };
+pub use media_trackers::*;
 pub use provider_ids::{AnyProviderIds, ExternalIdProvider};
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};

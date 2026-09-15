@@ -11,9 +11,9 @@ use remux_sdks::{
 };
 
 use crate::state::{
-    browser_metadata_country_code, get_or_create_device_id, get_origin,
-    get_stored_server, store_credentials, StoredServer, FAVICON, TAILWIND_CSS,
-    THEME_CSS,
+    browser_metadata_country_code, clear_credentials, get_or_create_device_id,
+    get_origin, get_stored_server, store_credentials, StoredServer, FAVICON,
+    TAILWIND_CSS, THEME_CSS,
 };
 
 mod components;
@@ -79,7 +79,11 @@ fn App() -> Element {
                             auth_state.set(AuthState::Admin);
                         }
                         Ok(_) | Err(ClientError::Unauthorized) => {
-                            auth_state.set(AuthState::Unauthorized);
+                            // Stale Jellyfin tokens on this hostname used to
+                            // trap the UI on "Admin access required" with no
+                            // login form. Drop them and show login.
+                            clear_credentials();
+                            auth_state.set(AuthState::LoggedOut);
                         }
                         Err(_) => {
                             // Network error / server still starting — don't touch credentials.
@@ -142,16 +146,8 @@ fn App() -> Element {
                     },
                     AuthState::Admin => rsx! { Router::<Route> {} },
                     AuthState::Unauthorized => rsx! {
-                        div { class: "login-page",
-                            div { class: "login-card",
-                                div { class: "login-header",
-                                    a { href: "/", class: "login-brand-label", "Remux" }
-                                    h1 { class: "login-title", "Admin Dashboard" }
-                                }
-                                div { class: "login-body",
-                                    div { class: "alert-error", "Admin access required." }
-                                }
-                            }
+                        Login {
+                            on_login: move |_| auth_state.set(AuthState::Admin),
                         }
                     },
                     AuthState::LoggedOut => rsx! {

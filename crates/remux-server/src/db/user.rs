@@ -1067,6 +1067,11 @@ impl UserMediaState {
         );
 
         let now = chrono::Utc::now().naive_utc();
+        // Import stamps `last_played_at` from Trakt `watched_at`. Do not clobber
+        // that with now on every favorite/rating/progress save.
+        let last_played_at = self
+            .last_played_at
+            .unwrap_or(now);
         sqlx::query(
             r#"
             INSERT INTO user_media_state (
@@ -1106,7 +1111,7 @@ impl UserMediaState {
         .bind(self.play_count)
         .bind(self.played_at)
         .bind(self.playback_position)
-        .bind(now)
+        .bind(last_played_at)
         .bind(self.subtitle_idx)
         .bind(self.audio_idx)
         .bind(self.rating)

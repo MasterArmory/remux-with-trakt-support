@@ -132,30 +132,12 @@ pub async fn shows_nextup(
     Query(q): Query<api::GetItemsQuery>,
 ) -> Result<impl IntoResponse> {
     // Home-screen call: no seriesId — return one next-up episode per in-progress series.
-    // When the unified setting is on, this feed is folded into Continue
-    // Watching instead — but only for this seriesId-less aggregate call; a
-    // per-series lookup (e.g. a client's "Next Episode" button) must still
-    // resolve normally regardless of the setting.
+    // Continue Watching can also include already-aired next episodes when
+    // enable_next_up_in_continue_watching is on. Keep this row anyway so
+    // upcoming (not-yet-aired) episodes still have a home.
     if q.series_id
         .is_none()
     {
-        if db::Settings::get_config_or_default(
-            &state
-                .ctx
-                .db,
-        )
-        .await
-        .enable_next_up_in_continue_watching
-        .unwrap_or(false)
-        {
-            return Ok(Json(api::BaseItemDtoQueryResult {
-                start_index: q
-                    .start_index
-                    .unwrap_or(0),
-                ..Default::default()
-            })
-            .into_response());
-        }
         return shows_nextup_all(state, session, q)
             .await
             .map(IntoResponse::into_response);

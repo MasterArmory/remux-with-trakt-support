@@ -41,6 +41,8 @@ pub enum Route {
     SettingsWebhooksRoute,
     #[route("/access/users")]
     AccessUsersRoute,
+    #[route("/access/trakt")]
+    AccessTraktRoute,
     #[route("/access/apikeys")]
     AccessApiKeysRoute,
     #[route("/tasks")]
@@ -148,6 +150,12 @@ pub(crate) fn SettingsWebhooksRoute() -> Element {
 pub(crate) fn AccessUsersRoute() -> Element {
     let app_state = use_context::<AppState>();
     rsx! { UsersPage { app_state } }
+}
+
+#[component]
+pub(crate) fn AccessTraktRoute() -> Element {
+    let app_state = use_context::<AppState>();
+    rsx! { MediaTrackersPage { app_state } }
 }
 
 #[component]

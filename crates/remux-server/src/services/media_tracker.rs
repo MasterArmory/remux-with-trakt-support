@@ -1,11 +1,11 @@
 //! Describing the item a delivery names, and the subscriber that scrobbles it.
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use anyhow::{Error, Result};
 use async_trait::async_trait;
 use chrono::Datelike;
-use tracing::warn;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -32,6 +32,7 @@ fn describe(media: &db::Media, series: Option<&db::Media>) -> MediaTrackerTarget
         series: series.map(|s| Box::new(describe(s, None))),
         season: media.parent_idx,
         episode: media.idx,
+        runtime_ticks: media.runtime,
     }
 }
 
@@ -234,8 +235,24 @@ impl Subscriber for MediaTrackerSubscriber {
                 .addons
                 .media_tracker_for(tracker.addon_id)
             {
+                let creds = match ensure_fresh_credentials(
+                    &self
+                        .ctx
+                        .db,
+                    addon.as_ref(),
+                    tracker,
+                    &tctx,
+                )
+                .await
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        errors.push(e);
+                        continue;
+                    }
+                };
                 match addon
-                    .on_event(&tracker_event, &target, &tracker.credentials, &tctx)
+                    .on_event(&tracker_event, &target, &creds, &tctx)
                     .await
                 {
                     Ok(()) => {
@@ -246,6 +263,44 @@ impl Subscriber for MediaTrackerSubscriber {
                             tracker.id,
                         )
                         .await;
+                    }
+                    Err(e) if e.requires_reauth() => {
+                        match addon
+                            .refresh(&creds, &tctx)
+                            .await
+                        {
+                            Ok(new_creds) => {
+                                let _ = db::UserMediaTracker::set_credentials(
+                                    &self
+                                        .ctx
+                                        .db,
+                                    tracker.id,
+                                    &new_creds,
+                                )
+                                .await;
+                                match addon
+                                    .on_event(
+                                        &tracker_event,
+                                        &target,
+                                        &new_creds,
+                                        &tctx,
+                                    )
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        let _ = db::UserMediaTracker::mark_success(
+                                            &self
+                                                .ctx
+                                                .db,
+                                            tracker.id,
+                                        )
+                                        .await;
+                                    }
+                                    Err(e2) => errors.push(anyhow::anyhow!("{e2}")),
+                                }
+                            }
+                            Err(e2) => errors.push(anyhow::anyhow!("{e2}")),
+                        }
                     }
                     Err(e) => {
                         errors.push(anyhow::anyhow!("{e}"));
@@ -261,6 +316,251 @@ impl Subscriber for MediaTrackerSubscriber {
             return Err(e);
         }
         Ok(())
+    }
+}
+
+fn creds_expiring(
+    creds: &crate::addons::media_tracker::MediaTrackerCredentials,
+) -> bool {
+    let v = creds.expose();
+    let created = v
+        .get("created_at")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0);
+    let expires = v
+        .get("expires_in")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(7 * 24 * 60 * 60);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let created = if created == 0 { now } else { created };
+    let ttl = if expires == 0 {
+        7 * 24 * 60 * 60
+    } else {
+        expires
+    };
+    now.saturating_add(3600) >= created.saturating_add(ttl)
+}
+
+pub async fn ensure_fresh_credentials(
+    db: &sqlx::SqlitePool,
+    addon: &dyn crate::addons::media_tracker::MediaTrackerAddon,
+    tracker: &db::UserMediaTracker,
+    tctx: &MediaTrackerCtx,
+) -> Result<crate::addons::media_tracker::MediaTrackerCredentials> {
+    let creds = tracker
+        .credentials
+        .clone();
+    if !creds_expiring(&creds) {
+        return Ok(creds);
+    }
+    let new = addon
+        .refresh(&creds, tctx)
+        .await?;
+    db::UserMediaTracker::set_credentials(db, tracker.id, &new).await?;
+    Ok(new)
+}
+
+/// Apply Trakt (or any tracker) history/progress to local user data so
+/// Continue Watching and Next Up light up in Jellyfin clients.
+/// Incremental cron pulls this many missing titles. First sync / manual
+/// `/sync` pass `usize::MAX` so the library can catch up in one go.
+pub const INCREMENTAL_NEW_TITLES_PER_SYNC: usize = 5;
+
+pub async fn apply_remote_watches(
+    ctx: &AppContext,
+    user_id: Uuid,
+    watches: &[crate::addons::media_tracker::RemoteWatch],
+    max_new_titles: usize,
+) -> Result<usize> {
+    let Some(user) = db::User::get_by_id(&ctx.db, &user_id).await? else {
+        return Ok(0);
+    };
+    let mut applied = 0usize;
+    let mut persisted = 0usize;
+    let mut persist_attempted: HashSet<i64> = HashSet::new();
+    for watch in watches {
+        let media = match resolve_local_media(&ctx.db, watch).await? {
+            Some(media) => media,
+            None if watch.watched => {
+                if persisted < max_new_titles {
+                    if persist_missing_from_watch(ctx, watch, &mut persist_attempted)
+                        .await?
+                    {
+                        persisted += 1;
+                    }
+                }
+                match resolve_local_media(&ctx.db, watch).await? {
+                    Some(media) => media,
+                    None => continue,
+                }
+            }
+            None => continue,
+        };
+        if watch.watched {
+            media
+                .mark_played(&ctx.db, &user, false, None)
+                .await?;
+            applied += 1;
+        }
+        if let Some(pct) = watch
+            .progress_percent
+            .filter(|p| *p > 0.0)
+        {
+            let ticks = watch
+                .position_ticks
+                .unwrap_or_else(|| {
+                    media
+                        .runtime
+                        .map(|rt| ((pct / 100.0) * rt as f64).round() as i64)
+                        .unwrap_or(10_000_000)
+                });
+            db::UserMediaState::update_playback(
+                &ctx.db, &user, &media, ticks, None, None, None,
+            )
+            .await?;
+            applied += 1;
+        } else if let Some(ticks) = watch
+            .position_ticks
+            .filter(|t| *t >= 10_000)
+        {
+            db::UserMediaState::update_playback(
+                &ctx.db, &user, &media, ticks, None, None, None,
+            )
+            .await?;
+            applied += 1;
+        }
+        if let Some(fav) = watch.favorite {
+            let mut state =
+                db::UserMediaState::get_or_new(&ctx.db, &user, &media).await?;
+            state.favorite = fav;
+            state
+                .save(&ctx.db)
+                .await?;
+            applied += 1;
+        }
+        if let Some(rating) = watch.rating {
+            if let Ok(r) = db::UserRating::try_from(rating as f64) {
+                db::UserMediaState::set_rating(&ctx.db, &user, &media, Some(r)).await?;
+                applied += 1;
+            }
+        }
+        if watch.watched {
+            if let Some(at) = watch.watched_at {
+                stamp_imported_watch(&ctx.db, user.id, media.id, at).await?;
+            }
+        }
+    }
+    Ok(applied)
+}
+
+async fn stamp_imported_watch(
+    db: &sqlx::SqlitePool,
+    user_id: Uuid,
+    media_id: Uuid,
+    watched_at: chrono::NaiveDateTime,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE user_media_state SET played_at = ?1, last_played_at = ?1 \
+         WHERE user_id = ?2 AND media_id = ?3",
+    )
+    .bind(watched_at)
+    .bind(user_id)
+    .bind(media_id)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// Persist a missing movie/series from Trakt ids via TMDB. Never talks to Trakt.
+async fn persist_missing_from_watch(
+    ctx: &AppContext,
+    watch: &crate::addons::media_tracker::RemoteWatch,
+    attempted: &mut HashSet<i64>,
+) -> Result<bool> {
+    let Some(tmdb) = watch
+        .ids
+        .tmdb
+    else {
+        return Ok(false);
+    };
+    if !attempted.insert(tmdb) {
+        return Ok(false);
+    }
+    let kind = if watch
+        .season
+        .is_some()
+        || watch
+            .episode
+            .is_some()
+    {
+        db::MediaKind::Series
+    } else {
+        db::MediaKind::Movie
+    };
+    if db::Media::find_by_external_ids(&ctx.db, &kind, &watch.ids)
+        .await
+        .is_some()
+    {
+        return Ok(false);
+    }
+    let canonical = format!("tmdb:{tmdb}");
+    let stub = db::Media {
+        id: crate::common::stable_media_uuid(&kind, &canonical),
+        title: canonical.clone(),
+        kind: kind.clone(),
+        external_ids: watch
+            .ids
+            .clone(),
+        ..Default::default()
+    };
+    let config =
+        std::sync::Arc::new(db::Settings::get_config_or_default(&ctx.db).await);
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(
+        (config
+            .meta_concurrency
+            .max(1)) as usize,
+    ));
+    info!(%tmdb, kind = %kind, "trakt import persisting missing title");
+    ctx.addons
+        .process_meta_item(stub, ctx.clone(), true, config, semaphore)
+        .await;
+    Ok(true)
+}
+
+async fn resolve_local_media(
+    db: &sqlx::SqlitePool,
+    watch: &crate::addons::media_tracker::RemoteWatch,
+) -> Result<Option<db::Media>> {
+    if let (Some(season), Some(episode)) = (watch.season, watch.episode) {
+        let Some(series_id) =
+            db::Media::find_by_external_ids(db, &db::MediaKind::Series, &watch.ids)
+                .await
+        else {
+            return Ok(None);
+        };
+        let found: Option<db::Media> = sqlx::query_as(
+            "SELECT * FROM media WHERE grandparent_id = ?1 AND kind = 'episode' \
+             AND parent_idx = ?2 AND idx = ?3 LIMIT 1",
+        )
+        .bind(series_id)
+        .bind(season)
+        .bind(episode)
+        .fetch_optional(db)
+        .await?;
+        return Ok(found);
+    }
+    let id = db::Media::find_by_external_ids(db, &db::MediaKind::Movie, &watch.ids)
+        .await
+        .or(
+            db::Media::find_by_external_ids(db, &db::MediaKind::Series, &watch.ids)
+                .await,
+        );
+    match id {
+        Some(id) => Ok(db::Media::get_by_id(db, &id).await?),
+        None => Ok(None),
     }
 }
 
@@ -484,5 +784,83 @@ mod tests {
             .await;
 
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn import_stamps_trakt_watched_at_not_now() {
+        let (_s, guard) = new_test_server()
+            .await
+            .unwrap();
+        let ctx = &guard.0;
+        let uid = user_id(ctx).await;
+        let user = db::User::get_by_id(&ctx.db, &uid)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let external_ids = db::ExternalIds {
+            tmdb: Some(1438),
+            ..Default::default()
+        };
+        let mut series = db::Media {
+            id: Uuid::from(&db::MediaIdRaw {
+                kind: db::MediaKind::Series,
+                external_ids: external_ids.clone(),
+                season: None,
+                episode: None,
+            }),
+            title: "The Wire".into(),
+            kind: db::MediaKind::Series,
+            external_ids: external_ids.clone(),
+            ..Default::default()
+        };
+        series
+            .save(&ctx.db)
+            .await
+            .unwrap();
+        let mut episode = db::Media {
+            title: "The Target".into(),
+            kind: db::MediaKind::Episode,
+            grandparent_id: Some(series.id),
+            idx: Some(1),
+            parent_idx: Some(1),
+            ..Default::default()
+        };
+        episode
+            .save(&ctx.db)
+            .await
+            .unwrap();
+
+        let watched_at = chrono::NaiveDateTime::parse_from_str(
+            "2026-07-15 17:43:00",
+            "%Y-%m-%d %H:%M:%S",
+        )
+        .unwrap();
+        let applied = apply_remote_watches(
+            ctx,
+            uid,
+            &[crate::addons::media_tracker::RemoteWatch {
+                ids: external_ids,
+                season: Some(1),
+                episode: Some(1),
+                watched: true,
+                position_ticks: None,
+                progress_percent: None,
+                watched_at: Some(watched_at),
+                favorite: None,
+                rating: None,
+            }],
+            usize::MAX,
+        )
+        .await
+        .unwrap();
+        assert_eq!(applied, 1);
+
+        let state = db::UserMediaState::get_or_new(&ctx.db, &user, &episode)
+            .await
+            .unwrap();
+        assert!(state.play_count > 0);
+        assert_eq!(state.played_at, Some(watched_at));
+        assert_eq!(state.last_played_at, Some(watched_at));
     }
 }

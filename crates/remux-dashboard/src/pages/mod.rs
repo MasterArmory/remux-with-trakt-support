@@ -5,6 +5,7 @@ pub mod collections;
 pub mod dashboard;
 pub mod devices;
 pub mod iptv;
+pub mod media_trackers;
 pub mod settings;
 pub mod streams;
 pub mod users;
@@ -17,6 +18,7 @@ pub use collections::CollectionsPage;
 pub use dashboard::DashboardPage;
 pub use devices::DevicesPage;
 pub use iptv::IptvPage;
+pub use media_trackers::MediaTrackersPage;
 pub use settings::{
     IntroSettingsCard, JellyfinImportCard, P2pSettingsCard, PlaybackSettingsCard,
     ProbeSettingsCard, RemuxdbSettingsCard, SearchSettingsCard, ServerSettingsCard,

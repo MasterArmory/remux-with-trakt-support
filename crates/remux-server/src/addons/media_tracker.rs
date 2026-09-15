@@ -195,6 +195,8 @@ pub struct MediaTrackerTarget {
     pub series: Option<Box<MediaTrackerTarget>>,
     pub season: Option<i64>,
     pub episode: Option<i64>,
+    /// Jellyfin-style ticks. Used to convert playback position into a percent.
+    pub runtime_ticks: Option<i64>,
 }
 
 /// Whether any id here is one a media tracker could key on. `ExternalIds`
@@ -422,6 +424,15 @@ pub trait MediaTrackerAddon: AddonKind + Send + Sync {
         Err(MediaTrackerError::unsupported("history import"))
     }
 
+    /// Trakt `GET /sync/last_activities`. `None` means always pull.
+    async fn remote_activity_at(
+        &self,
+        _creds: &MediaTrackerCredentials,
+        _ctx: &MediaTrackerCtx,
+    ) -> MediaTrackerResult<Option<chrono::NaiveDateTime>> {
+        Ok(None)
+    }
+
     /// `None` for a full sweep.
     async fn pull_changes(
         &self,
@@ -461,6 +472,8 @@ pub struct RemoteWatch {
     pub watched: bool,
     /// Present only when the provider reports partial progress.
     pub position_ticks: Option<i64>,
+    /// Trakt scrobble/playback progress 0–100. Converted with local runtime.
+    pub progress_percent: Option<f64>,
     pub watched_at: Option<chrono::NaiveDateTime>,
     /// `None` when the provider does not report favourites. Without this a
     /// provider could declare `favorites: Pull` that core had no way to act on.
@@ -625,6 +638,7 @@ mod tests {
             series: None,
             season: None,
             episode: None,
+            runtime_ticks: None,
         }
     }
 
@@ -726,6 +740,7 @@ mod tests {
             episode: None,
             watched: false,
             position_ticks: None,
+            progress_percent: None,
             watched_at: None,
             favorite: Some(true),
             rating: None,
@@ -747,6 +762,7 @@ mod tests {
             episode: None,
             watched: false,
             position_ticks: None,
+            progress_percent: None,
             watched_at: None,
             favorite: None,
             rating: Some(7.0),

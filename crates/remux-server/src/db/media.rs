@@ -6212,6 +6212,7 @@ impl Media {
             .play_count
             .max(1);
         state.played_at = Some(now);
+        state.last_played_at = Some(now);
         state.playback_position = 0;
         state
             .save(db)

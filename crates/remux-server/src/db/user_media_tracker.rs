@@ -155,6 +155,32 @@ impl UserMediaTracker {
         .await?)
     }
 
+    pub async fn list_connected(db: &SqlitePool) -> Result<Vec<Self>> {
+        Ok(sqlx::query_as::<_, Self>(&format!(
+            "SELECT {COLS} FROM user_media_trackers WHERE status = 'connected' \
+             ORDER BY created_at ASC"
+        ))
+        .fetch_all(db)
+        .await?)
+    }
+
+    pub async fn set_credentials(
+        db: &SqlitePool,
+        id: Uuid,
+        credentials: &MediaTrackerCredentials,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE user_media_trackers SET credentials = ?2, updated_at = ?3 \
+             WHERE id = ?1",
+        )
+        .bind(id)
+        .bind(sqlx::types::Json(credentials))
+        .bind(Utc::now().naive_utc())
+        .execute(db)
+        .await?;
+        Ok(())
+    }
+
     pub async fn list_for_addon(db: &SqlitePool, addon_id: Uuid) -> Result<Vec<Self>> {
         Ok(sqlx::query_as::<_, Self>(&format!(
             "SELECT {COLS} FROM user_media_trackers WHERE addon_id = ?1 \

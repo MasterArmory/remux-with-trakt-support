@@ -22,6 +22,7 @@ mod clean_transcode_folder;
 mod clear_cache;
 mod clear_image_cache;
 mod jellyfin_import;
+mod media_tracker_sync;
 mod purge_iptv;
 mod purge_media;
 mod purge_metrics;
@@ -39,6 +40,7 @@ use clean_transcode_folder::CleanTranscodeFolderTask;
 use clear_cache::ClearCacheTask;
 use clear_image_cache::ClearImageCacheTask;
 use jellyfin_import::JellyfinImportTask;
+use media_tracker_sync::MediaTrackerSyncTask;
 use purge_iptv::PurgeIptvTask;
 use purge_media::PurgeMediaTask;
 use purge_metrics::PurgeMetricsTask;
@@ -326,6 +328,9 @@ impl TaskService {
             .register_task(Arc::new(JellyfinImportTask))
             .await?;
         service
+            .register_task(Arc::new(MediaTrackerSyncTask))
+            .await?;
+        service
             .register_task(Arc::new(RefreshIptvTask))
             .await?;
         service
@@ -334,6 +339,12 @@ impl TaskService {
         service
             .register_task(Arc::new(PurgeMetricsTask))
             .await?;
+        ensure_media_tracker_sync_trigger(
+            &service
+                .ctx
+                .db,
+        )
+        .await?;
         let triggers = db::TaskTrigger::get_all(
             &service
                 .ctx
@@ -558,6 +569,23 @@ impl TaskService {
             .map(|(k, v)| (k.clone(), v.view()))
             .collect()
     }
+}
+
+async fn ensure_media_tracker_sync_trigger(db: &sqlx::SqlitePool) -> Result<()> {
+    let existing = db::TaskTrigger::get_by_task_id(db, "MediaTrackerSync").await?;
+    if !existing.is_empty() {
+        return Ok(());
+    }
+    db::TaskTrigger {
+        id: crate::common::get_uuid().to_string(),
+        task_id: "MediaTrackerSync".to_string(),
+        kind: TaskTriggerInfoType::IntervalTrigger,
+        time_limit_hours: None,
+        cron: Some("*/5 * * * *".to_string()),
+    }
+    .save(db)
+    .await?;
+    Ok(())
 }
 
 pub(super) fn iter_dir(

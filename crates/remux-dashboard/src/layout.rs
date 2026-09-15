@@ -112,6 +112,7 @@ pub fn DashboardLayout() -> Element {
         Route::SettingsIntroRoute => "Intro",
         Route::SettingsRemuxdbRoute => "Remuxdb",
         Route::AccessUsersRoute => "Users",
+        Route::AccessTraktRoute => "Trakt",
         Route::AccessApiKeysRoute => "API Keys",
         Route::TasksRoute => "Tasks",
         Route::DevicesRoute => "Devices",
@@ -245,11 +246,16 @@ pub fn DashboardLayout() -> Element {
 
                     SidebarGroup {
                         label: "Access",
-                        active: matches!(route, Route::AccessUsersRoute | Route::AccessApiKeysRoute),
+                        active: matches!(route, Route::AccessUsersRoute | Route::AccessTraktRoute | Route::AccessApiKeysRoute),
                         NavSubItem {
                             label: "Users",
                             active: route == Route::AccessUsersRoute,
                             on_click: move |_| { navigator().push(Route::AccessUsersRoute); sidebar_open.set(false); },
+                        }
+                        NavSubItem {
+                            label: "Trakt",
+                            active: route == Route::AccessTraktRoute,
+                            on_click: move |_| { navigator().push(Route::AccessTraktRoute); sidebar_open.set(false); },
                         }
                         NavSubItem {
                             label: "API Keys",

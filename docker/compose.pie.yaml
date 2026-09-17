@@ -1,0 +1,38 @@
+services:
+  remux:
+    image: remux:trakt
+    container_name: remux
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    networks:
+      - proxy
+    volumes:
+      - /opt/remux/data:/data
+      - /home/ubuntu/remux/dashboard:/app/dashboard:ro
+      - /home/ubuntu/remux-web:/app/web:ro
+      - /home/ubuntu/remux/target/release/remux-server:/app/remux-server:ro
+    environment:
+      - DASHBOARD_PATH=/app/dashboard
+      - WEB_PATH=/app/web
+      - DATA_DIR=/data
+      - PORT=3000
+      - DISABLE_DHT=true
+      - SQLITE_MAX_VARIABLE_NUMBER=32766
+      - TZ=America/New_York
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=proxy"
+      - "traefik.http.middlewares.remux-https.redirectscheme.scheme=https"
+      - "traefik.http.routers.remux-http.entrypoints=web"
+      - "traefik.http.routers.remux-http.middlewares=remux-https"
+      - "traefik.http.routers.remux-http.rule=Host(`jelly.rcshields.com`)"
+      - "traefik.http.routers.remux.entrypoints=websecure"
+      - "traefik.http.routers.remux.rule=Host(`jelly.rcshields.com`)"
+      - "traefik.http.routers.remux.tls=true"
+      - "traefik.http.routers.remux.tls.certresolver=le"
+      - "traefik.http.services.remux.loadbalancer.server.port=3000"
+
+networks:
+  proxy:
+    external: true

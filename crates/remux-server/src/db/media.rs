@@ -4991,26 +4991,28 @@ impl Media {
                 .iter()
                 .map(|m| m.id)
                 .collect();
-            let mut tags_qb = sqlx::QueryBuilder::new(
-                "SELECT media_id, tag FROM media_tags WHERE media_id IN (",
-            );
-            let mut sep = tags_qb.separated(", ");
-            for id in &ids {
-                sep.push_bind(id);
-            }
-            tags_qb.push(") ORDER BY tag");
-            let tag_rows = tags_qb
-                .build()
-                .fetch_all(db)
-                .await?;
             let mut tags_map: HashMap<Uuid, Vec<String>> = HashMap::new();
-            for row in tag_rows {
-                let media_id: Uuid = row.get(0);
-                let tag: String = row.get(1);
-                tags_map
-                    .entry(media_id)
-                    .or_default()
-                    .push(tag);
+            for chunk in ids.chunks(SQLITE_VAR_LIMIT) {
+                let mut tags_qb = sqlx::QueryBuilder::new(
+                    "SELECT media_id, tag FROM media_tags WHERE media_id IN (",
+                );
+                let mut sep = tags_qb.separated(", ");
+                for id in chunk {
+                    sep.push_bind(id);
+                }
+                tags_qb.push(") ORDER BY tag");
+                let tag_rows = tags_qb
+                    .build()
+                    .fetch_all(db)
+                    .await?;
+                for row in tag_rows {
+                    let media_id: Uuid = row.get(0);
+                    let tag: String = row.get(1);
+                    tags_map
+                        .entry(media_id)
+                        .or_default()
+                        .push(tag);
+                }
             }
             for media in &mut records {
                 if let Some(tags) = tags_map.remove(&media.id) {

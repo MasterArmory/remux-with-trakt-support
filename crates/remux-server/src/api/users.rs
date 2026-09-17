@@ -1273,6 +1273,7 @@ async fn default_userviews(
     let channel_filter = db::MediaFilter {
         kind: Some(vec![db::MediaKind::TvChannel]),
         enabled: Some(true),
+        limit: Some(1),
         ..Default::default()
     };
     let (library_result, channel_result) = tokio::join!(

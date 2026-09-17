@@ -29,18 +29,21 @@ fn log_dir() -> PathBuf {
     data_dir().join("logs")
 }
 
-fn build_config() -> remux_server::Config {
-    let base = data_dir();
-    remux_server::Config {
-        data_dir: base,
-        ..Default::default()
-    }
-    .resolve()
-}
-
-fn server_url() -> String {
-    let port = build_config().port;
-    format!("http://localhost:{port}/admin")
+fn server_url(config: &remux_server::Config) -> String {
+    // `0.0.0.0`/`::` mean "every interface", which isn't itself an address a
+    // browser can open — loopback is always one of those interfaces, so fall
+    // back to it. A specific bind address is used as-is.
+    let host = if config
+        .host
+        .is_unspecified()
+    {
+        "localhost".to_string()
+    } else {
+        config
+            .host
+            .to_string()
+    };
+    format!("http://{host}:{}/admin", config.port)
 }
 
 fn ensure_data_dirs(config: &remux_server::Config) -> Result<()> {
@@ -85,7 +88,9 @@ fn main() -> Result<()> {
     cleanup_old_logs(&log_dir);
     remux_server::setup_logging(Some(&log_dir));
 
-    let config = build_config();
+    let mut config = remux_server::load_config_from_env()?;
+    config.data_dir = data_dir();
+    let config = config.resolve();
     ensure_data_dirs(&config)?;
 
     // Start the remux server in a background tokio thread with embedded assets.
@@ -152,7 +157,7 @@ fn main() -> Result<()> {
     tracing::info!("remux desktop started — tray icon active");
 
     let menu_channel = MenuEvent::receiver();
-    let url = server_url();
+    let url = server_url(&config);
 
     event_loop.run(move |_event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
@@ -185,7 +190,7 @@ async fn serve(config: remux_server::Config) -> anyhow::Result<()> {
         remux_server::admin_from_filesystem(&paths.dashboard_path)
     };
 
-    let port = config.port;
+    let addr = std::net::SocketAddr::new(config.host, config.port);
     let (router, _) = remux_server::init_app(config, None, admin, |pool| {
         #[cfg(jellyfin_web_built)]
         {
@@ -199,7 +204,7 @@ async fn serve(config: remux_server::Config) -> anyhow::Result<()> {
         }
     })
     .await?;
-    remux_server::bind_and_serve(router, port).await
+    remux_server::bind_and_serve(router, addr).await
 }
 
 fn load_icon() -> tray_icon::Icon {

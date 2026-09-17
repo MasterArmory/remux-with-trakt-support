@@ -727,6 +727,24 @@ pub trait MetaAddon: Send + Sync {
     /// Called after all items for a given meta_id have been processed.
     /// Addons can use this to evict per-series caches they built during the run.
     fn on_series_done(&self, _meta_id: &str) {}
+    /// Called when `meta_fetch` was cancelled by the caller's own timeout
+    /// rather than returning an `Err` on its own. `tokio::time::timeout`
+    /// drops the in-flight future instead of letting it run to completion,
+    /// so the addon's own error-handling code inside `meta_fetch` never runs
+    /// and never gets a chance to remember the failure — this is the only
+    /// place that can tell the addon a timeout happened for `media`.
+    fn on_meta_fetch_timeout(&self, _media: &db::Media) {}
+    /// Time left before this addon's shared upstream cooldown (see
+    /// `SharedRateLimit`) clears, or `Duration::ZERO` if it has none or isn't
+    /// currently blocked. `refresh_meta` checks this before starting a
+    /// timeout-bounded `meta_fetch` call: a cooldown longer than the timeout
+    /// would otherwise consume the entire budget just waiting, and the call
+    /// gets killed before ever sending a request — indistinguishable from a
+    /// genuinely hung addon, but really just the rate limiter working as
+    /// intended.
+    async fn rate_limit_cooldown(&self) -> Duration {
+        Duration::ZERO
+    }
     /// Fetch remote image candidates for manual image selection in the UI.
     async fn images_fetch(
         &self,
@@ -746,6 +764,14 @@ pub trait TreeAddon: Send + Sync {
         root: &db::Media,
         ctx: &AppContext,
     ) -> Result<Option<Vec<db::Media>>>;
+    /// Time left before this addon's shared upstream cooldown clears. See
+    /// `MetaAddon::rate_limit_cooldown` — the same reasoning applies here:
+    /// `get_direct_children` bounds this call with a timeout, and without
+    /// this check a long cooldown would consume that whole budget waiting,
+    /// indistinguishable from a genuinely hung tree fetch.
+    async fn rate_limit_cooldown(&self) -> Duration {
+        Duration::ZERO
+    }
 }
 
 #[async_trait]
@@ -1634,6 +1660,17 @@ impl AddonService {
             return Ok(());
         }
 
+        // Cap on a single addon's `meta_fetch` call, below. Some addons
+        // (observed: AIO, proxying to a third-party `aiometadata` backend)
+        // hang up to their own ~30s upstream timeout under load; without
+        // this, one bad addon stalls the whole item even though the other
+        // addons in the same fan-out already finished.
+        let addon_fetch_timeout = Duration::from_secs(
+            config
+                .addon_fetch_timeout_secs
+                .unwrap_or(5)
+                .max(1) as u64,
+        );
         let fetch_started = std::time::Instant::now();
         let media_ref: &db::Media = media;
         let results = futures::future::join_all(
@@ -1654,12 +1691,48 @@ impl AddonService {
                             addon = %addon,
                             "metadata addon request starting"
                         );
-                        let result = r
+                        let meta_addon = r
                             .meta
                             .as_ref()
-                            .unwrap()
-                            .meta_fetch(media_ref, ctx, config)
+                            .unwrap();
+                        // A shared upstream cooldown (see `SharedRateLimit`) that outlasts
+                        // our own timeout would otherwise consume the entire budget just
+                        // waiting for it to clear, dying before a request is ever sent —
+                        // indistinguishable from a genuinely hung addon, but really just
+                        // the rate limiter doing its job. Skip the attempt entirely rather
+                        // than let that masquerade as a failure.
+                        let cooldown = meta_addon
+                            .rate_limit_cooldown()
                             .await;
+                        let result = if cooldown >= addon_fetch_timeout {
+                            trace!(
+                                target: "remux_server::metadata_refresh",
+                                id = %media_ref.id,
+                                addon = %addon,
+                                cooldown = ?cooldown,
+                                "skipping addon fetch: shared rate limit cooldown exceeds timeout"
+                            );
+                            Ok(None)
+                        } else {
+                            // A single flaky addon (observed: AIO/aiometadata hanging up to
+                            // its own 30s upstream timeout) must not stall an entire item's
+                            // refresh — the other addons in this join_all already finished.
+                            match tokio::time::timeout(
+                                addon_fetch_timeout,
+                                meta_addon.meta_fetch(media_ref, ctx, config),
+                            )
+                            .await
+                            {
+                                Ok(result) => result,
+                                Err(_) => {
+                                    meta_addon.on_meta_fetch_timeout(media_ref);
+                                    Err(anyhow!(
+                                        "addon meta_fetch timed out after {:?}",
+                                        addon_fetch_timeout
+                                    ))
+                                }
+                            }
+                        };
                         trace!(
                             target: "remux_server::metadata_refresh",
                             id = %media_ref.id,
@@ -1710,7 +1783,7 @@ impl AddonService {
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    error!(addon = %r.row.name, error = ?e, "meta addon error")
+                    error!(addon = %r.row.name, error = %e, "meta addon error")
                 }
             }
         }
@@ -1913,7 +1986,14 @@ impl AddonService {
         &self,
         node: &db::Media,
         ctx: &AppContext,
+        config: &api::ServerConfiguration,
     ) -> Vec<db::Media> {
+        let fetch_timeout = Duration::from_secs(
+            config
+                .addon_fetch_timeout_secs
+                .unwrap_or(5)
+                .max(1) as u64,
+        );
         let applicable: Vec<Arc<dyn TreeAddon>> = self
             .inner
             .load()
@@ -1959,10 +2039,30 @@ impl AddonService {
             .collect();
 
         for addon in &applicable {
-            match addon
-                .get_children(node, ctx)
-                .await
+            let cooldown = addon
+                .rate_limit_cooldown()
+                .await;
+            if cooldown >= fetch_timeout {
+                debug!(
+                    id = %node.id,
+                    cooldown = ?cooldown,
+                    "skipping tree fetch: shared rate limit cooldown exceeds timeout"
+                );
+                continue;
+            }
+            let result = match tokio::time::timeout(
+                fetch_timeout,
+                addon.get_children(node, ctx),
+            )
+            .await
             {
+                Ok(result) => result,
+                Err(_) => Err(anyhow!(
+                    "addon get_children timed out after {:?}",
+                    fetch_timeout
+                )),
+            };
+            match result {
                 Ok(Some(children)) if !children.is_empty() => return children,
                 Ok(_) => continue,
                 Err(e) => debug!(id = %node.id, error = %e, "get_children failed"),
@@ -2093,6 +2193,13 @@ impl AddonService {
                 save_pending_relations(&ctx, &[media.clone()]).await;
                 save_pending_tags(&ctx, &[media.clone()]).await;
             }
+            // Evict per-series caches/failure markers here too, not just on
+            // the success paths below — `medias_cache` and `failed` are
+            // scoped to the addon's own lifetime, not one refresh run, so a
+            // series that hits this path and never reaches the eviction call
+            // stays cached (or permanently blacklisted) across every future
+            // refresh until the server restarts.
+            self.notify_series_done(&media);
             return media.id;
         }
 
@@ -2144,6 +2251,7 @@ impl AddonService {
         let pending_images = std::mem::take(&mut media.images);
         if let Err(e) = db::Media::upsert(&ctx.db, &[media.clone()]).await {
             error!(id = %media.id, error = %e, "failed to upsert root media");
+            self.notify_series_done(&media);
             return media.id;
         }
 
@@ -2208,6 +2316,12 @@ impl AddonService {
             }
             gp
         };
+        // Shared as one Arc, not deep-cloned per child: every level-1 and
+        // level-2 child below gets its own `.grandparent`, and cloning a
+        // `Media` (including any embedded genre relations) into each of
+        // potentially thousands of children is exactly what made large-tree
+        // refreshes memory-heavy.
+        let gp_stub = Arc::new(gp_stub);
 
         db::UserMediaState::remap_orphaned_for(&ctx.db, &[media.clone()]).await;
         save_pending_relations(&ctx, &[media.clone()]).await;
@@ -2217,7 +2331,7 @@ impl AddonService {
 
         // Level 1: direct children (Seasons, Albums, etc.)
         let raw_level1 = self
-            .get_direct_children(&media, &ctx)
+            .get_direct_children(&media, &ctx, &config)
             .await;
         if raw_level1.is_empty() {
             self.notify_series_done(&media);
@@ -2275,7 +2389,7 @@ impl AddonService {
                 let existing_l1 = &existing_l1;
                 async move {
                     child.parent_id = Some(actual_root_id);
-                    child.grandparent = Some(Box::new(gp_stub));
+                    child.grandparent = Some(gp_stub);
 
                     // Adopt the existing DB UUID (and refreshed_at) for this (kind, idx)
                     // position if found. The new child UUID may differ from what's stored
@@ -2368,7 +2482,7 @@ impl AddonService {
                 async move {
                     let actual_child_id = child.id;
                     let raw_level2 = svc
-                        .get_direct_children(child, &ctx)
+                        .get_direct_children(child, &ctx, &config)
                         .await;
                     if raw_level2.is_empty() {
                         return;
@@ -2378,7 +2492,7 @@ impl AddonService {
                     for mut gc in raw_level2 {
                         gc.parent_id = Some(actual_child_id);
                         gc.grandparent_id = Some(actual_root_id);
-                        gc.grandparent = Some(Box::new(gp_stub.clone()));
+                        gc.grandparent = Some(gp_stub.clone());
 
                         // Adopt existing UUID + refreshed_at from the pre-loaded grandchild
                         // map. `gc` is freshly parsed from the addon's raw response, which
@@ -3885,7 +3999,7 @@ mod tests {
             .clone();
 
         let children = service
-            .get_direct_children(&series, &ctx)
+            .get_direct_children(&series, &ctx, &api::ServerConfiguration::default())
             .await;
 
         assert!(
